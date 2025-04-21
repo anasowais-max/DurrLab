@@ -1,0 +1,115 @@
+import os
+import sys
+import time
+import argparse
+
+from pypylon import pylon
+from stage.motor_ini.core import find_stages
+
+from PIL import Image
+import numpy as np
+
+
+def init_stage():
+    """
+    Discover and return the first connected Thorlabs PFM450 stage.
+    Raises an error if no stage is found.
+    """
+    stages = list(find_stages())
+    if not stages:
+        raise RuntimeError("No Thorlabs stages detected. Check connection and permissions.")
+    stage = stages[0]
+    return stage
+
+
+def init_camera():
+    """
+    Initialize and return an opened Basler pylon camera.
+    """
+    tl_factory = pylon.TlFactory.GetInstance()
+    cam = pylon.InstantCamera(tl_factory.CreateFirstDevice())
+    cam.Open()
+    # Optionally adjust camera parameters here
+    return cam
+
+
+def capture_frame(camera):
+    """
+    Capture a single frame from the camera and return it as a NumPy array.
+    """
+    # Grab one image
+    camera.StartGrabbingMax(1)
+    if camera.IsGrabbing():
+        result = camera.RetrieveResult(5000, pylon.TimeoutHandling_ThrowException)
+        if result.GrabSucceeded():
+            array = result.Array
+            result.Release()
+            return array
+        else:
+            result.Release()
+            raise RuntimeError(f"Image grab failed: {result.ErrorDescription}")
+    else:
+        raise RuntimeError("Camera is not grabbing")
+
+
+def main(args):
+    # Prepare output directory
+    outdir = args.outdir
+    os.makedirs(outdir, exist_ok=True)
+
+    # Initialize devices
+    print("Initializing stage...")
+    stage = init_stage()
+    print(f"Using stage: {stage}")
+
+    print("Initializing camera...")
+    cam = init_camera()
+    print(f"Using camera: {cam.GetDeviceInfo().GetModelName()}")
+
+    # Optionally home stage
+    if args.home:
+        print("Homing stage...")
+        stage.move_home()
+        # Wait for home to complete
+        time.sleep(1)
+
+    step = args.step
+    slices = args.slices
+
+    print(f"Beginning capture: {slices} slices, step size {step} {stage.units}")
+
+    for i in range(slices):
+        pos = i * step
+        print(f"Moving stage to position {pos} {stage.units} (slice {i+1}/{slices})...")
+        # Absolute move; blocking until complete
+        stage.set_pos(pos, blocking=True)
+        # Give time for mechanical settling
+        time.sleep(args.settle)
+
+        print("Capturing image...")
+        img_array = capture_frame(cam)
+
+        # Save image
+        filename = os.path.join(outdir, f"slice_{i:03d}.png")
+        im = Image.fromarray(img_array)
+        im.save(filename)
+        print(f"Saved {filename}")
+
+    print("Capture complete. Closing camera.")
+    cam.Close()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Capture a Z-stack by moving a Thorlabs stage and snapping images with a Basler camera.")
+    parser.add_argument('--slices', type=int, required=True, help='Number of slices/photos to capture')
+    parser.add_argument('--step', type=float, default=0.1, help='Step size in stage units (e.g., mm) between slices')
+    parser.add_argument('--outdir', type=str, default='./images', help='Directory to save captured images')
+    parser.add_argument('--settle', type=float, default=0.5, help='Settle time (s) after moving stage before capture')
+    parser.add_argument('--home', action='store_true', help='Home the stage before starting capture')
+    args = parser.parse_args()
+
+    try:
+        main(args)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
